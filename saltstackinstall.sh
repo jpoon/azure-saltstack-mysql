@@ -1,39 +1,44 @@
 #!/bin/bash
 
-echo $(date +"%F %T%z") "starting script saltstackinstall.sh"
+set -ex
+
+echo $(date +"%F %T%z") "Starting saltstackinstall.sh"
 
 # arguments
-adminUsername=$1
-adminPassword=$2
-subscriptionId=$3
-storageName=$4
-vnetName=$5
-location=$6
-resourceGroupname=$7
-subnetName=$8
-clientid=$9
-secret=${10}
-tenantid=${11}
-publicip=${12}
-nsgname=${13}
+ADMINUSERNAME=${1:-saltadmin}
+RESOURCEGROUPNAME=${2}
+STORAGEACCOUNTNAME=${3}
+VNETNAME=${4:-salt-vnet}
+SUBNETNAME=${5:-subnet}
+SUBSCRIPTIONID=${6}
+SP_CLIENTID=${7}
+SP_SECRET=${8}
+SP_TENANTID=${9}
 
 echo "----------------------------------"
 echo "INSTALLING SALT"
 echo "----------------------------------"
 
 curl -s -o $HOME/bootstrap_salt.sh -L https://bootstrap.saltstack.com
-sh $HOME/bootstrap_salt.sh -M -p python-pip git v2017.5
-#sh $HOME/bootstrap_salt.sh -M -p python2-boto git 54ed167
+sudo sh $HOME/bootstrap_salt.sh -M -p python-pip git v2017.5
 
-sudo apt-get install build-essential libssl-dev libffi-dev python-dev
-pip install azure 
-#pip install msrest msrestazure
+sudo apt-get -y install build-essential libssl-dev libffi-dev python-dev
+pip install --upgrade pip
+pip install azure --user
 pip install -U azure-mgmt-compute azure-mgmt-network azure-mgmt-resource azure-mgmt-storage azure-mgmt-web
 
-cd /etc/salt
+vmPrivateIpAddress=$(curl -H Metadata:true "http://169.254.169.254/metadata/instance/network/interface/0/ipv4/ipaddress/0/ipaddress?api-version=2017-03-01&format=text")
+vmPublicIpAddress=$(curl -H Metadata:true "http://169.254.169.254/metadata/instance/network/interface/0/ipv4/ipaddress/0/publicip?api-version=2017-03-01&format=text")
+vmLocation=$(curl -H Metadata:true "http://169.254.169.254/metadata/instance/compute/location?api-version=2017-03-01&format=text")
 
-sed -i 's/#interface:.*/interface: $(hostname --ip-address)/' master
-sed -i '/hash_type:.*/s/^#//g' master
+echo "
+interface: ${vmPrivateIpAddress}
+hash_type: sha256
+file_roots:
+  base:
+    - /srv/salt
+    - /srv/salt/mysql-formula
+" | sudo tee --append /etc/salt/master
 
 sudo systemctl start salt-master.service
 sudo systemctl enable salt-master.service
@@ -43,24 +48,116 @@ echo "----------------------------------"
 echo "CONFIGURING SALT-CLOUD"
 echo "----------------------------------"
 
-#--- here is where i stopped on 5/13.
-
-mkdir cloud.providers.d
-cd cloud.providers.d
-echo "azure:
+sudo mkdir -p /etc/salt/cloud.providers.d
+echo "
+azurearm-conf:
   driver: azurearm
-  subscription_id: $subscriptionId
-  client_id: $clientid
-  secret: $secret
-  tenant: $tenantid
+  subscription_id: $SUBSCRIPTIONID
+  client_id: $SP_CLIENTID
+  secret: $SP_SECRET
+  tenant: $SP_TENANTID
   minion:
-    master: $publicip
+    master: ${vmPublicIpAddress}
     hash_type: sha256
     tcp_keepalive: True
     tcp_keepalive_idle: 180
   grains:
-    home: /home/$adminUsername
+    home: /home/$ADMINUSERNAME
     provider: azure
-    user: $adminUsername" > azure.conf
-cd ..
-mkdir cloud.profiles.d && cd cloud.profiles.d
+    user: $ADMINUSERNAME
+" | sudo tee /etc/salt/cloud.providers.d/azure.conf
+
+sudo mkdir -p /etc/salt/cloud.profiles.d 
+sudo echo "
+azure-ubuntu:
+  provider: azurearm-conf
+  image: Canonical|UbuntuServer|14.04.5-LTS|14.04.201612050
+  size: Standard_D1_v2
+  location: ${vmLocation}
+  ssh_username: $ADMINUSERNAME
+  ssh_password: SaltPa$$word!
+  resource_group: $RESOURCEGROUPNAME
+  network_resource_group: $RESOURCEGROUPNAME
+  network: $VNETNAME
+  subnet: $SUBNETNAME
+  public_ip: True
+  storage_account: $STORAGEACCOUNTNAME
+" | sudo tee /etc/salt/cloud.profiles.d/azure.conf
+
+echo "----------------------------------"
+echo "RUNNING SALT-CLOUD"
+echo "----------------------------------"
+
+sudo salt-cloud -p azure-ubuntu ${RESOURCEGROUPNAME}-minion-0
+
+echo "----------------------------------"
+echo "CONFIGURING STATE"
+echo "----------------------------------"
+
+# Create user. Add SSH authorized keys.
+sudo mkdir -p /srv/salt/key --parents
+sudo cp ~/.ssh/authorized_keys /srv/salt/key/authorized_keys
+echo "
+$ADMINUSERNAME:
+  group.present:
+    - name: $ADMINUSERNAME
+  user.present:
+    - fullname: $ADMINUSERNAME
+    - shell: /bin/bash
+    - home: /home/$ADMINUSERNAME
+    - groups:
+      - sudo
+      - $ADMINUSERNAME
+
+/home/$ADMINUSERNAME/.ssh:
+  file.directory:
+    - user: $ADMINUSERNAME
+    - group: $ADMINUSERNAME
+    - mode: 700
+  require:
+    - user: $ADMINUSERNAME
+
+/home/$ADMINUSERNAME/.ssh/authorized_keys:
+  file:
+    - managed
+    - user: $ADMINUSERNAME
+    - group: $ADMINUSERNAME
+    - source: salt://key/authorized_keys
+    - mode: 600
+" | sudo tee /srv/salt/createuser.sls
+
+# mysql
+cd /srv/salt
+sudo git clone https://github.com/saltstack-formulas/mysql-formula.git 
+sudo systemctl restart salt-master.service
+
+echo "
+base:
+  '*':
+    - createuser
+    - mysql
+" | sudo tee /srv/salt/top.sls
+
+echo "----------------------------------"
+echo "CONFIGURING PILLAR"
+echo "----------------------------------"
+
+sudo mkdir -p /srv/pillar
+echo "
+base:
+  '*':
+    - mysql
+" | sudo tee /srv/pillar/top.sls
+
+echo "
+mysql:
+  server:
+    root_password: 'devitconf'
+  database:
+    - devitconf
+" | sudo tee /srv/pillar/mysql.sls
+
+echo "----------------------------------"
+echo "SALT APPLY STATE"
+echo "----------------------------------"
+sudo salt '*' state.highstate
